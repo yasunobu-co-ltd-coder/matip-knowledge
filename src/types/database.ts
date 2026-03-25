@@ -2,7 +2,7 @@
 // 既存テーブルの型定義（参照用・変更しない）
 // ===================================================
 
-/** yasunobu-memo テーブル */
+/** matip-memo テーブル */
 export type MemoRecord = {
   id: string;
   created_at: string;
@@ -18,7 +18,7 @@ export type MemoRecord = {
   status: "open" | "未着手" | "対応中" | "done";
 };
 
-/** pocket-yasunobu テーブル */
+/** pocket-matip テーブル */
 export type MinutesRecord = {
   id: string | number;
   created_at: string;

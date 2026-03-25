@@ -78,8 +78,8 @@ async function collectAllClientNames(): Promise<Map<string, Set<string>>> {
   // メモ・議事録のみを顧客の存在判定に使用
   // TODO・決定事項だけ残っている旧名の顧客は表示しない（名前変更時に旧名が残るのを防ぐ）
   const [c1, c2] = await Promise.all([
-    supabase.from("yasunobu-memo").select("client_name"),
-    supabase.from("pocket-yasunobu").select("client_name"),
+    supabase.from("matip-memo").select("client_name"),
+    supabase.from("pocket-matip").select("client_name"),
   ]);
 
   const allNames = new Set<string>();

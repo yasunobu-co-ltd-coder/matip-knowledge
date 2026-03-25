@@ -28,8 +28,8 @@ export async function GET(req: NextRequest) {
   }
 
   // 4テーブル並列クエリ
-  const memoQ = supabaseAdmin.from("yasunobu-memo").select("id, memo, client_name, due_date").order("created_at", { ascending: false }).limit(30);
-  const minQ = supabaseAdmin.from("pocket-yasunobu").select("id, summary, client_name, created_at").order("created_at", { ascending: false }).limit(30);
+  const memoQ = supabaseAdmin.from("matip-memo").select("id, memo, client_name, due_date").order("created_at", { ascending: false }).limit(30);
+  const minQ = supabaseAdmin.from("pocket-matip").select("id, summary, client_name, created_at").order("created_at", { ascending: false }).limit(30);
   const todoQ = supabaseAdmin.from("todos").select("id, content, client_name, due_date").order("created_at", { ascending: false }).limit(30);
   const decQ = supabaseAdmin.from("decisions").select("id, content, client_name, created_at").order("created_at", { ascending: false }).limit(30);
 

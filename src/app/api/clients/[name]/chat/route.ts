@@ -229,7 +229,7 @@ async function executeTool(
         };
         if (userId) memoRow.created_by = userId;
         if (userId) memoRow.assignee = userId;
-        const { error } = await supabaseAdmin.from("yasunobu-memo").insert(memoRow);
+        const { error } = await supabaseAdmin.from("matip-memo").insert(memoRow);
         if (error) throw error;
         return { success: true, message: `メモ「${(args.body as string).slice(0, 30)}...」を記録しました` };
       }
@@ -249,7 +249,7 @@ async function executeTool(
         };
         if (userId) calRow.created_by = userId;
         if (userId) calRow.assignee = userId;
-        const { error } = await supabaseAdmin.from("yasunobu-memo").insert(calRow);
+        const { error } = await supabaseAdmin.from("matip-memo").insert(calRow);
         if (error) throw error;
         return { success: true, message: `カレンダーに「${eventContent}」を${eventDate}に追加しました` };
       }
