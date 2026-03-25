@@ -1,0 +1,654 @@
+"use client";
+
+import { useState, useEffect, useRef, useCallback } from "react";
+import useSWR, { mutate as globalMutate } from "swr";
+import { fetcher } from "@/lib/swr";
+import { useUser, AppUser } from "@/lib/user-context";
+import { supabase } from "@/lib/supabase";
+
+type Channel = { id: string; name: string; client_name: string | null; created_at: string };
+type TeamMessage = {
+  id: string; channel_id: string; user_id: string; user_name: string; content: string; created_at: string;
+  reply_to_id: string | null; attachment_type: string | null; attachment_id: string | null;
+};
+type ReadStatus = { user_id: string; last_read_at: string };
+type AttachmentItem = { id: string; type: "memo" | "minutes" | "todo" | "decision"; label: string; client_name: string | null; date: string | null };
+type ClientItem = { id: string; name: string };
+
+const TYPE_LABELS: Record<string, { label: string; color: string; bg: string }> = {
+  memo: { label: "メモ", color: "#1d4ed8", bg: "#dbeafe" },
+  minutes: { label: "議事録", color: "#7c3aed", bg: "#f3e8ff" },
+  todo: { label: "TODO", color: "#a16207", bg: "#fefce8" },
+  decision: { label: "決定", color: "#15803d", bg: "#dcfce7" },
+};
+
+export default function TeamChatPage() {
+  const { user } = useUser();
+  const [activeChannelId, setActiveChannelId] = useState<string | null>(null);
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const sendingRef = useRef(false);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  // チャンネル作成
+  const [showNewChannel, setShowNewChannel] = useState(false);
+  const [newChannelName, setNewChannelName] = useState("");
+  const [selectedMembers, setSelectedMembers] = useState<Set<string>>(new Set());
+
+  // メンバー管理
+  const [showMembers, setShowMembers] = useState(false);
+
+  // リプライ
+  const [replyTo, setReplyTo] = useState<TeamMessage | null>(null);
+
+  // 添付
+  const [showAttachPanel, setShowAttachPanel] = useState(false);
+  const [attachStep, setAttachStep] = useState<"client" | "items">("client");
+  const [attachClientName, setAttachClientName] = useState("");
+  const [attachSearch, setAttachSearch] = useState("");
+  const [attachResults, setAttachResults] = useState<AttachmentItem[]>([]);
+  const [selectedAttachment, setSelectedAttachment] = useState<AttachmentItem | null>(null);
+  const [attachLoading, setAttachLoading] = useState(false);
+
+  // ===== SWRでキャッシュ付きデータ取得 =====
+  const { data: allUsers } = useSWR<AppUser[]>("/api/users", fetcher, { dedupingInterval: 60000 });
+  const { data: channels, mutate: mutateChannels } = useSWR<Channel[]>("/api/team-chat/channels", fetcher, { dedupingInterval: 30000 });
+  const { data: clientList } = useSWR<ClientItem[]>("/api/clients", fetcher, { dedupingInterval: 60000 });
+
+  // メッセージ: チャンネルごとにキャッシュ → 切替時に即表示
+  const msgKey = activeChannelId ? `/api/team-chat/messages?channel_id=${activeChannelId}&limit=100` : null;
+  const { data: messages = [], mutate: mutateMessages } = useSWR<TeamMessage[]>(msgKey, fetcher, {
+    dedupingInterval: 5000,
+    revalidateOnFocus: false,
+  });
+
+  // 既読状況: チャンネルごとにキャッシュ
+  const readKey = activeChannelId ? `/api/team-chat/readers?channel_id=${activeChannelId}` : null;
+  const { data: readStatuses = [] } = useSWR<ReadStatus[]>(readKey, fetcher, {
+    dedupingInterval: 5000,
+    revalidateOnFocus: false,
+  });
+
+  // メンバー: チャンネルごとにキャッシュ
+  const memberKey = activeChannelId ? `/api/team-chat/channels/${activeChannelId}/members` : null;
+  const { data: memberData, mutate: mutateMembers } = useSWR<{ user_id: string }[]>(memberKey, fetcher, {
+    dedupingInterval: 30000,
+    revalidateOnFocus: false,
+  });
+  const channelMembers = memberData?.map((m) => m.user_id) ?? [];
+
+  // SW登録 + Push購読
+  useEffect(() => {
+    if (!user || typeof navigator === "undefined" || !("serviceWorker" in navigator)) return;
+    navigator.serviceWorker.register("/sw.js").then(async (reg) => {
+      const vapidKey = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY;
+      if (!vapidKey) return;
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        if (Notification.permission !== "granted") return;
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(vapidKey),
+        });
+      }
+      fetch("/api/push/subscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ subscription: sub.toJSON(), user_id: user.id }),
+      });
+    }).catch(() => {});
+  }, [user]);
+
+  // 初期チャンネル選択
+  useEffect(() => {
+    if (channels && channels.length > 0 && !activeChannelId) {
+      setActiveChannelId(channels[0].id);
+    }
+  }, [channels, activeChannelId]);
+
+  // チャンネル切替時に既読マーク（fire-and-forget）
+  useEffect(() => {
+    if (!activeChannelId || !user) return;
+    fetch("/api/team-chat/read", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: user.id, channel_id: activeChannelId }),
+    });
+  }, [activeChannelId, user]);
+
+  // Realtime: 新メッセージ受信
+  const realtimeOk = useRef(false);
+  useEffect(() => {
+    if (!activeChannelId || !supabase) return;
+    realtimeOk.current = false;
+    const channel = supabase
+      .channel(`team-chat-${activeChannelId}`)
+      .on("postgres_changes", { event: "INSERT", schema: "public", table: "team_messages", filter: `channel_id=eq.${activeChannelId}` },
+        (payload) => {
+          const newMsg = payload.new as TeamMessage;
+          mutateMessages((prev) => prev && !prev.some((m) => m.id === newMsg.id) ? [...prev, newMsg] : prev, false);
+          if (user) {
+            fetch("/api/team-chat/read", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ user_id: user.id, channel_id: activeChannelId }),
+            });
+          }
+          globalMutate(readKey);
+        }
+      )
+      .subscribe((status) => {
+        realtimeOk.current = status === "SUBSCRIBED";
+      });
+    // Realtimeが繋がらない場合のフォールバック: 10秒ごとにポーリング
+    const poll = setInterval(() => {
+      if (!realtimeOk.current) mutateMessages();
+    }, 10000);
+    return () => { clearInterval(poll); supabase!.removeChannel(channel); };
+  }, [activeChannelId, user, mutateMessages, readKey]);
+
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+
+  // 既読人数計算
+  const getReadCount = (msg: TeamMessage) => {
+    if (msg.user_id !== user?.id) return null;
+    const msgTime = new Date(msg.created_at).getTime();
+    return readStatuses.filter((rs) => rs.user_id !== user?.id && new Date(rs.last_read_at).getTime() >= msgTime).length;
+  };
+
+  // 顧客のアイテムを取得
+  const loadClientItems = useCallback(async (clientName: string, q = "") => {
+    setAttachLoading(true);
+    try {
+      const params = new URLSearchParams({ client_name: clientName });
+      if (q) params.set("q", q);
+      const res = await fetch(`/api/team-chat/attachments?${params}`);
+      const data = await res.json();
+      if (Array.isArray(data)) setAttachResults(data);
+    } catch { /* ignore */ }
+    setAttachLoading(false);
+  }, []);
+
+  // 顧客選択時にアイテムを取得
+  const selectAttachClient = useCallback((name: string) => {
+    setAttachClientName(name);
+    setAttachStep("items");
+    setAttachSearch("");
+    loadClientItems(name);
+  }, [loadClientItems]);
+
+  // アイテム検索のデバウンス
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  useEffect(() => {
+    if (attachStep !== "items" || !attachClientName) return;
+    clearTimeout(searchTimerRef.current);
+    searchTimerRef.current = setTimeout(() => {
+      loadClientItems(attachClientName, attachSearch);
+    }, 300);
+    return () => clearTimeout(searchTimerRef.current);
+  }, [attachSearch, attachStep, attachClientName, loadClientItems]);
+
+  const sendMessage = async () => {
+    if (!input.trim() || !user || !activeChannelId || sendingRef.current) return;
+    sendingRef.current = true;
+    setSending(true);
+    try {
+      const body: Record<string, unknown> = {
+        channel_id: activeChannelId, user_id: user.id, user_name: user.name, content: input.trim(),
+      };
+      if (replyTo) body.reply_to_id = replyTo.id;
+      if (selectedAttachment) {
+        body.attachment_type = selectedAttachment.type;
+        body.attachment_id = selectedAttachment.id;
+      }
+      const res = await fetch("/api/team-chat/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) {
+        const newMsg = await res.json();
+        mutateMessages((prev) => prev && !prev.some((m) => m.id === newMsg.id) ? [...prev, newMsg] : prev, false);
+        setInput("");
+        setReplyTo(null);
+        setSelectedAttachment(null);
+      }
+    } finally { setSending(false); sendingRef.current = false; }
+  };
+
+  const createChannel = async () => {
+    if (!newChannelName.trim() || !user) return;
+    try {
+      const res = await fetch("/api/team-chat/channels", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: newChannelName.trim() }),
+      });
+      if (!res.ok) { alert(`エラー: ${(await res.json()).error}`); return; }
+      const ch = await res.json();
+      const memberIds = [...selectedMembers];
+      if (!memberIds.includes(user.id)) memberIds.push(user.id);
+      await fetch(`/api/team-chat/channels/${ch.id}/members`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_ids: memberIds }),
+      });
+      setNewChannelName("");
+      setSelectedMembers(new Set());
+      setShowNewChannel(false);
+      mutateChannels();
+      setActiveChannelId(ch.id);
+    } catch (e) { alert(`通信エラー: ${e instanceof Error ? e.message : String(e)}`); }
+  };
+
+  const toggleMember = async (userId: string) => {
+    if (!activeChannelId) return;
+    if (channelMembers.includes(userId)) {
+      await fetch(`/api/team-chat/channels/${activeChannelId}/members`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: userId }),
+      });
+    } else {
+      await fetch(`/api/team-chat/channels/${activeChannelId}/members`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_ids: [userId] }),
+      });
+    }
+    mutateMembers();
+  };
+
+  // リプライ先のメッセージを探す
+  const getReplyTarget = (msg: TeamMessage) => {
+    if (!msg.reply_to_id) return null;
+    return messages.find((m) => m.id === msg.reply_to_id) || null;
+  };
+
+  const activeChannel = channels?.find((c) => c.id === activeChannelId);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 0, height: "calc(100dvh - 200px)" }}>
+      {/* チャンネルタブ */}
+      <div style={{ display: "flex", gap: 6, padding: "0 0 8px", overflowX: "auto", flexShrink: 0 }}>
+        {channels?.map((ch) => (
+          <button key={ch.id} onClick={() => setActiveChannelId(ch.id)}
+            style={{
+              padding: "6px 14px", borderRadius: 20,
+              border: ch.id === activeChannelId ? "2px solid #15803d" : "1px solid #e2e8f0",
+              background: ch.id === activeChannelId ? "#f0fdf4" : "#fff",
+              color: ch.id === activeChannelId ? "#15803d" : "#64748b",
+              fontSize: 13, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0,
+            }}
+          >{ch.name}</button>
+        ))}
+        <button onClick={() => setShowNewChannel(true)}
+          style={{ padding: "6px 12px", borderRadius: 20, border: "1px dashed #cbd5e1", background: "#fff", color: "#94a3b8", fontSize: 13, cursor: "pointer", whiteSpace: "nowrap", flexShrink: 0 }}
+        >+</button>
+      </div>
+
+      {/* 新規チャンネル作成 */}
+      {showNewChannel && (
+        <div style={{ padding: "8px 0", flexShrink: 0, display: "flex", flexDirection: "column", gap: 8 }}>
+          <input name="channel-name" value={newChannelName} onChange={(e) => setNewChannelName(e.target.value)}
+            placeholder="チャンネル名" autoFocus onKeyDown={(e) => e.key === "Enter" && createChannel()}
+            style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 13, outline: "none" }}
+          />
+          <div style={{ fontSize: 12, color: "#64748b", fontWeight: 600 }}>参加者を選択:</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {allUsers?.map((u) => (
+              <button key={u.id}
+                onClick={() => setSelectedMembers((prev) => { const s = new Set(prev); s.has(u.id) ? s.delete(u.id) : s.add(u.id); return s; })}
+                style={{
+                  padding: "4px 12px", borderRadius: 16, fontSize: 12, fontWeight: 600, cursor: "pointer",
+                  border: selectedMembers.has(u.id) ? "2px solid #15803d" : "1px solid #e2e8f0",
+                  background: selectedMembers.has(u.id) ? "#f0fdf4" : "#fff",
+                  color: selectedMembers.has(u.id) ? "#15803d" : "#64748b",
+                }}
+              >{u.name}</button>
+            ))}
+          </div>
+          <div style={{ display: "flex", gap: 6 }}>
+            <button onClick={createChannel} style={actionBtnStyle}>作成</button>
+            <button onClick={() => { setShowNewChannel(false); setSelectedMembers(new Set()); }}
+              style={{ ...actionBtnStyle, background: "#f1f5f9", color: "#64748b" }}>取消</button>
+          </div>
+        </div>
+      )}
+
+      {/* チャンネルヘッダー */}
+      {activeChannel && (
+        <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0 8px", flexShrink: 0 }}>
+          <span style={{ fontSize: 14, fontWeight: 700, color: "#1e293b" }}>{activeChannel.name}</span>
+          <button onClick={() => setShowMembers(!showMembers)}
+            style={{ fontSize: 11, color: "#64748b", background: "#f1f5f9", border: "1px solid #e2e8f0", borderRadius: 12, padding: "2px 10px", cursor: "pointer" }}
+          >{showMembers ? "閉じる" : `メンバー(${channelMembers.length})`}</button>
+        </div>
+      )}
+
+      {/* メンバー管理パネル */}
+      {showMembers && (
+        <div style={{ padding: "4px 0 8px", flexShrink: 0 }}>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {allUsers?.map((u) => (
+              <button key={u.id} onClick={() => toggleMember(u.id)}
+                style={{
+                  padding: "4px 12px", borderRadius: 16, fontSize: 12, fontWeight: 600, cursor: "pointer",
+                  border: channelMembers.includes(u.id) ? "2px solid #15803d" : "1px solid #e2e8f0",
+                  background: channelMembers.includes(u.id) ? "#f0fdf4" : "#fff",
+                  color: channelMembers.includes(u.id) ? "#15803d" : "#94a3b8",
+                }}
+              >{u.name}{channelMembers.includes(u.id) ? " ✓" : ""}</button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* メッセージ一覧 */}
+      <div style={{ flex: 1, overflowY: "auto", display: "flex", flexDirection: "column", gap: 4, padding: "8px 0", minHeight: 0 }}>
+        {messages.length === 0 && (
+          <div style={{ textAlign: "center", color: "#94a3b8", fontSize: 13, padding: "40px 0" }}>メッセージがありません</div>
+        )}
+        {messages.map((msg) => (
+          <SwipeableMessage key={msg.id} msg={msg} isMe={msg.user_id === user?.id}
+            readCount={getReadCount(msg)} replyTarget={getReplyTarget(msg)}
+            attType={msg.attachment_type ? TYPE_LABELS[msg.attachment_type] : null}
+            onReply={() => setReplyTo(msg)}
+            onDelete={async () => {
+              if (!user || !confirm("このメッセージを取り消しますか？")) return;
+              const res = await fetch("/api/team-chat/messages", {
+                method: "DELETE",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ message_id: msg.id, user_id: user.id }),
+              });
+              if (res.ok) mutateMessages((prev) => prev?.filter((m) => m.id !== msg.id), false);
+            }} />
+        ))}
+        <div ref={bottomRef} />
+      </div>
+
+      {/* リプライプレビュー */}
+      {replyTo && (
+        <div style={{
+          display: "flex", alignItems: "center", gap: 8, padding: "6px 12px", flexShrink: 0,
+          background: "#f0fdf4", borderRadius: "8px 8px 0 0", borderLeft: "3px solid #15803d",
+        }}>
+          <div style={{ flex: 1, fontSize: 12, color: "#64748b", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            <span style={{ fontWeight: 600, color: "#15803d" }}>{replyTo.user_name}</span>に返信: {replyTo.content.slice(0, 40)}
+          </div>
+          <button onClick={() => setReplyTo(null)}
+            style={{ background: "none", border: "none", color: "#94a3b8", fontSize: 16, cursor: "pointer", padding: "0 4px" }}>✕</button>
+        </div>
+      )}
+
+      {/* 添付プレビュー */}
+      {selectedAttachment && (
+        <div style={{
+          display: "flex", alignItems: "center", gap: 8, padding: "6px 12px", flexShrink: 0,
+          background: TYPE_LABELS[selectedAttachment.type]?.bg || "#f1f5f9",
+          borderRadius: replyTo ? 0 : "8px 8px 0 0",
+          borderLeft: `3px solid ${TYPE_LABELS[selectedAttachment.type]?.color || "#64748b"}`,
+        }}>
+          <div style={{ flex: 1, fontSize: 12, color: "#64748b", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            <span style={{ fontWeight: 600, color: TYPE_LABELS[selectedAttachment.type]?.color }}>
+              {TYPE_LABELS[selectedAttachment.type]?.label}
+            </span>: {selectedAttachment.label}
+          </div>
+          <button onClick={() => setSelectedAttachment(null)}
+            style={{ background: "none", border: "none", color: "#94a3b8", fontSize: 16, cursor: "pointer", padding: "0 4px" }}>✕</button>
+        </div>
+      )}
+
+      {/* 添付パネル: 顧客選択 → アイテム一覧 */}
+      {showAttachPanel && (
+        <div style={{
+          flexShrink: 0, padding: "8px 0", maxHeight: 240, display: "flex", flexDirection: "column", gap: 6,
+          borderTop: "1px solid #e2e8f0",
+        }}>
+          {attachStep === "client" ? (
+            <>
+              <div style={{ fontSize: 12, fontWeight: 700, color: "#64748b", padding: "0 4px" }}>顧客を選択:</div>
+              <div style={{ overflowY: "auto", flex: 1 }}>
+                {clientList?.map((c) => (
+                  <button key={c.id} onClick={() => selectAttachClient(c.name)}
+                    style={{
+                      display: "block", width: "100%", padding: "8px 12px", border: "none",
+                      borderBottom: "1px solid #f1f5f9", background: "#fff", cursor: "pointer",
+                      textAlign: "left", fontSize: 13, color: "#1e293b", fontWeight: 500,
+                    }}
+                  >{c.name}</button>
+                ))}
+                {(!clientList || clientList.length === 0) && (
+                  <div style={{ fontSize: 12, color: "#94a3b8", textAlign: "center", padding: 16 }}>顧客がありません</div>
+                )}
+              </div>
+            </>
+          ) : (
+            <>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "0 4px" }}>
+                <button onClick={() => { setAttachStep("client"); setAttachResults([]); setAttachSearch(""); }}
+                  style={{ background: "none", border: "none", fontSize: 14, color: "#15803d", cursor: "pointer", fontWeight: 700, padding: 0 }}>← 戻る</button>
+                <span style={{ fontSize: 13, fontWeight: 700, color: "#1e293b" }}>{attachClientName}</span>
+              </div>
+              <input name="attach-search" value={attachSearch} onChange={(e) => setAttachSearch(e.target.value)}
+                placeholder="絞り込み..."
+                style={{ padding: "6px 12px", borderRadius: 8, border: "1px solid #e2e8f0", fontSize: 12, outline: "none" }}
+              />
+              <div style={{ overflowY: "auto", flex: 1 }}>
+                {attachLoading && <div style={{ fontSize: 12, color: "#94a3b8", textAlign: "center", padding: 8 }}>読み込み中...</div>}
+                {!attachLoading && attachResults.length === 0 && (
+                  <div style={{ fontSize: 12, color: "#94a3b8", textAlign: "center", padding: 8 }}>データなし</div>
+                )}
+                {attachResults.map((item) => {
+                  const t = TYPE_LABELS[item.type];
+                  return (
+                    <button key={`${item.type}-${item.id}`}
+                      onClick={() => { setSelectedAttachment(item); setShowAttachPanel(false); setAttachStep("client"); setAttachSearch(""); }}
+                      style={{
+                        display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "6px 10px",
+                        border: "none", borderBottom: "1px solid #f1f5f9", background: "#fff", cursor: "pointer",
+                        textAlign: "left", fontSize: 12,
+                      }}
+                    >
+                      <span style={{
+                        padding: "2px 8px", borderRadius: 10, fontSize: 10, fontWeight: 700,
+                        background: t?.bg, color: t?.color, flexShrink: 0,
+                      }}>{t?.label}</span>
+                      <span style={{ color: "#1e293b", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{item.label}</span>
+                      {item.date && <span style={{ fontSize: 10, color: "#94a3b8", flexShrink: 0 }}>{item.date}</span>}
+                    </button>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* 入力欄 */}
+      <div style={{ display: "flex", gap: 8, padding: "8px 0 0", flexShrink: 0, alignItems: "center" }}>
+        <button
+          onClick={() => { setShowAttachPanel(!showAttachPanel); if (showAttachPanel) { setAttachSearch(""); setAttachStep("client"); setAttachResults([]); } }}
+          style={{
+            width: 38, height: 38, borderRadius: "50%", border: "1px solid #e2e8f0",
+            background: showAttachPanel ? "#f0fdf4" : "#fff",
+            color: showAttachPanel ? "#15803d" : "#64748b",
+            fontSize: 20, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
+            flexShrink: 0,
+          }}
+        >{showAttachPanel ? "✕" : "+"}</button>
+        <input name="team-message" value={input} onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); sendMessage(); } }}
+          placeholder="メッセージを入力..."
+          style={{ flex: 1, padding: "10px 14px", borderRadius: 12, border: "1px solid #e2e8f0", fontSize: 14, outline: "none", color: "#1e293b" }}
+          disabled={!user || !activeChannelId}
+        />
+        <button onClick={sendMessage} disabled={sending || !input.trim() || !user}
+          style={{
+            padding: "10px 20px", borderRadius: 12, border: "none",
+            background: sending || !input.trim() ? "#94a3b8" : "#15803d",
+            color: "#fff", fontSize: 14, fontWeight: 700, cursor: sending || !input.trim() ? "default" : "pointer",
+            flexShrink: 0,
+          }}
+        >送信</button>
+      </div>
+    </div>
+  );
+}
+
+function urlBase64ToUint8Array(base64String: string) {
+  const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+  const rawData = atob(base64);
+  return Uint8Array.from([...rawData].map((c) => c.charCodeAt(0)));
+}
+
+const actionBtnStyle: React.CSSProperties = {
+  padding: "8px 14px", borderRadius: 8, border: "none",
+  background: "#15803d", color: "#fff", fontSize: 13, fontWeight: 600, cursor: "pointer",
+};
+
+const SWIPE_THRESHOLD = 60;
+
+function SwipeableMessage({ msg, isMe, readCount, replyTarget, attType, onReply, onDelete }: {
+  msg: TeamMessage; isMe: boolean; readCount: number | null;
+  replyTarget: TeamMessage | null;
+  attType: { label: string; color: string; bg: string } | null;
+  onReply: () => void;
+  onDelete: () => void;
+}) {
+  const [offsetX, setOffsetX] = useState(0);
+  const [showMenu, setShowMenu] = useState(false);
+  const touchStartX = useRef(0);
+  const touchStartY = useRef(0);
+  const swiping = useRef(false);
+  const triggered = useRef(false);
+
+  const time = new Date(msg.created_at).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" });
+
+  const onTouchStart = (e: React.TouchEvent) => {
+    touchStartX.current = e.touches[0].clientX;
+    touchStartY.current = e.touches[0].clientY;
+    swiping.current = false;
+    triggered.current = false;
+  };
+
+  const onTouchMove = (e: React.TouchEvent) => {
+    const dx = e.touches[0].clientX - touchStartX.current;
+    const dy = e.touches[0].clientY - touchStartY.current;
+    if (!swiping.current && Math.abs(dy) > Math.abs(dx)) return;
+    if (dx > 10) swiping.current = true;
+    if (!swiping.current) return;
+    e.preventDefault();
+    const clamped = Math.min(Math.max(dx, 0), 80);
+    setOffsetX(clamped);
+    if (clamped >= SWIPE_THRESHOLD && !triggered.current) {
+      triggered.current = true;
+      if (navigator.vibrate) navigator.vibrate(20);
+    }
+  };
+
+  const onTouchEnd = () => {
+    if (triggered.current) onReply();
+    setOffsetX(0);
+    swiping.current = false;
+  };
+
+  const handleContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault();
+    if (isMe) setShowMenu(true);
+    else onReply();
+  };
+
+  return (
+    <div style={{ position: "relative", overflow: "hidden" }}>
+      {/* スワイプ中の返信アイコン */}
+      <div style={{
+        position: "absolute", left: 8, top: "50%", transform: "translateY(-50%)",
+        opacity: Math.min(offsetX / SWIPE_THRESHOLD, 1),
+        fontSize: 18, color: "#15803d", transition: offsetX === 0 ? "opacity 0.2s" : "none",
+        pointerEvents: "none",
+      }}>&#8617;</div>
+
+      <div
+        onTouchStart={onTouchStart}
+        onTouchMove={onTouchMove}
+        onTouchEnd={onTouchEnd}
+        style={{
+          display: "flex", flexDirection: "column", alignItems: isMe ? "flex-end" : "flex-start",
+          transform: `translateX(${offsetX}px)`,
+          transition: offsetX === 0 ? "transform 0.2s ease-out" : "none",
+        }}
+      >
+        {!isMe && (
+          <span style={{ fontSize: 11, color: "#64748b", fontWeight: 600, marginBottom: 2, paddingLeft: 4 }}>{msg.user_name}</span>
+        )}
+
+        {replyTarget && (
+          <div style={{
+            maxWidth: "80%", padding: "4px 10px", marginBottom: 2,
+            borderLeft: "3px solid #94a3b8", borderRadius: 6,
+            background: "#f8fafc", fontSize: 11, color: "#64748b",
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+          }}>
+            <span style={{ fontWeight: 600 }}>{replyTarget.user_name}</span>: {replyTarget.content.slice(0, 50)}
+          </div>
+        )}
+
+        {attType && (
+          <div style={{
+            maxWidth: "80%", padding: "6px 10px", marginBottom: 2, borderRadius: 8,
+            background: attType.bg, border: `1px solid ${attType.color}20`,
+            fontSize: 11, color: attType.color, fontWeight: 600,
+          }}>
+            {attType.label}を参照
+          </div>
+        )}
+
+        <div
+          onContextMenu={handleContextMenu}
+          style={{
+            maxWidth: "85%", padding: "8px 12px",
+            borderRadius: isMe ? "14px 14px 4px 14px" : "14px 14px 14px 4px",
+            background: isMe ? "#15803d" : "#f1f5f9",
+            color: isMe ? "#fff" : "#1e293b",
+            fontSize: 14, lineHeight: 1.6, whiteSpace: "pre-wrap", wordBreak: "break-word",
+          }}>
+          {msg.content}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "0 4px" }}>
+          <span style={{ fontSize: 10, color: "#94a3b8", marginTop: 2 }}>{time}</span>
+          {isMe && readCount !== null && readCount > 0 && (
+            <span style={{ fontSize: 10, color: "#15803d", marginTop: 2 }}>既読 {readCount}</span>
+          )}
+        </div>
+      </div>
+
+      {/* 送信取り消しメニュー（自分のメッセージのみ） */}
+      {showMenu && (
+        <div onClick={() => setShowMenu(false)}
+          style={{ position: "fixed", inset: 0, zIndex: 200 }}>
+          <div onClick={(e) => e.stopPropagation()}
+            style={{
+              position: "fixed", left: "50%", top: "50%", transform: "translate(-50%, -50%)",
+              background: "#fff", borderRadius: 12, boxShadow: "0 4px 20px rgba(0,0,0,0.15)",
+              padding: 4, minWidth: 160, zIndex: 201,
+            }}>
+            <button onClick={() => { setShowMenu(false); onReply(); }}
+              style={{
+                display: "block", width: "100%", padding: "10px 16px", border: "none",
+                background: "none", fontSize: 14, color: "#1e293b", textAlign: "left", cursor: "pointer",
+                borderRadius: 8,
+              }}>返信</button>
+            <button onClick={() => { setShowMenu(false); onDelete(); }}
+              style={{
+                display: "block", width: "100%", padding: "10px 16px", border: "none",
+                background: "none", fontSize: 14, color: "#ef4444", textAlign: "left", cursor: "pointer",
+                borderRadius: 8,
+              }}>送信取り消し</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
